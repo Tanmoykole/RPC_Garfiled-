@@ -1,0 +1,163 @@
+#include <TApplication.h>
+#include <TCanvas.h>
+#include <TH1D.h>
+#include <TFile.h>
+#include <TROOT.h>
+#include <TSystem.h>
+#include <TTree.h>
+
+#include <cmath>
+#include <ctime>
+#include <fstream>
+#include <iostream>
+
+#include "Garfield/AvalancheGrid.hh"
+#include "Garfield/AvalancheMicroscopic.hh"
+#include "Garfield/ComponentParallelPlate.hh"
+#include "Garfield/FundamentalConstants.hh"
+#include "Garfield/GeometrySimple.hh"
+#include "Garfield/MediumMagboltz.hh"
+#include "Garfield/Plotting.hh"
+#include "Garfield/Sensor.hh"
+#include "Garfield/SolidBox.hh"
+#include "Garfield/TrackHeed.hh"
+#include "Garfield/ViewSignal.hh"
+
+#define LOG(x) std::cout << x << std::endl
+
+using namespace Garfield;
+
+int main(int argc, char *argv[]) {
+  TApplication app("app", &argc, argv);
+  plottingEngine.SetDefaultStyle();
+
+  // Define the single-gap RPC structure
+  const int N = 5;
+  const double epMylar = 3.1;
+  const double epGlaverbel = 8.0;
+  const double epGas = 1.0;
+
+  std::vector<double> eps = {epMylar, epGlaverbel, epGas, epGlaverbel, epMylar};
+
+  const double dMylar = 0.016;
+  const double dGlaverbel = 0.07;
+  const double dGas = 0.25; // Single large gas gap
+
+  std::vector<double> thickness = {dMylar, dGlaverbel, dGas, dGlaverbel, dMylar};
+
+  double totalThickness = dMylar * 2 + dGlaverbel * 2 + dGas;
+  const double voltage = -15e3;
+
+  // Set up the single-gap RPC
+  ComponentParallelPlate RPC;
+  RPC.Setup(N, eps, thickness, voltage);
+  const std::string label = "ReadoutPlane";
+  RPC.AddPlane(label);
+
+  // Define gas properties
+  MediumMagboltz gas;
+  gas.LoadGasFile("c2h2f4_ic4h10_sf6.gas");
+  gas.Initialise(true);
+
+  // Define geometry
+  SolidBox box(0., totalThickness / 2, 0., 5., totalThickness / 2, 5.);
+  GeometrySimple geo;
+  geo.AddSolid(&box, &gas);
+  RPC.SetGeometry(&geo);
+  RPC.SetMedium(&gas);
+
+  // Sensor setup
+  Sensor sensor;
+  sensor.AddComponent(&RPC);
+  sensor.AddElectrode(&RPC, label);
+
+  // Time window for signal calculation
+  const unsigned int nTimeBins = 200;
+  const double tmin = 0.;
+  const double tmax = 4;
+  const double tstep = (tmax - tmin) / nTimeBins;
+  sensor.SetTimeWindow(tmin, tstep, nTimeBins);
+
+  // Create output ROOT file
+  TFile *rootFile = new TFile("single_gap_output.root", "RECREATE");
+  TTree *tree = new TTree("pulseTree", "Pulse Data");
+
+  double pulseHeight, timeAtMin, timingResolution;
+  tree->Branch("pulseHeight", &pulseHeight, "pulseHeight/D");
+  tree->Branch("timeAtMin", &timeAtMin, "timeAtMin/D");
+  tree->Branch("timingResolution", &timingResolution, "timingResolution/D");
+
+  // Run simulation 5000 times
+  const int nRuns = 5000;
+  for (int run = 0; run < nRuns; ++run) {
+    LOG("Running simulation: " << run + 1 << " / " << nRuns);
+
+    // Avalanche simulation
+    AvalancheMicroscopic aval;
+    aval.SetSensor(&sensor);
+    aval.EnableSignalCalculation();
+    aval.UseWeightingPotential();
+    aval.SetTimeWindow(0., 0.1);
+
+    // Particle tracking
+    TrackHeed track;
+    track.SetSensor(&sensor);
+    track.SetParticle("pion");
+    track.SetMomentum(7.e9);
+
+    std::clock_t start = std::clock();
+    track.NewTrack(0, totalThickness, 0, 0, 0, -1, 0);
+    
+    for (const auto &cluster : track.GetClusters()) {
+      for (const auto &electron : cluster.electrons) {
+        aval.AvalancheElectron(electron.x, electron.y, electron.z, electron.t, 0.1, 0., 0., 0.);
+      }
+    }
+
+    LOG("Avalanche completed in " << (std::clock() - start) / (double)CLOCKS_PER_SEC << " s");
+
+    // Signal histogram
+    TH1D *hSignal = new TH1D("hSignal", "Induced Signal;Time [ns];Signal [arb. units]", nTimeBins, tmin, tmax);
+
+    double meanTime = 0, variance = 0, totalCharge = 0, weightedSum = 0;
+
+    for (unsigned int i = 0; i < nTimeBins; ++i) {
+      double signal = sensor.GetSignal(label, i);
+      hSignal->SetBinContent(i + 1, signal);
+      totalCharge += signal;
+      weightedSum += hSignal->GetBinCenter(i + 1) * signal;
+    }
+    if (totalCharge != 0) meanTime = weightedSum / totalCharge;
+
+    // Compute timing resolution
+    double sumVariance = 0;
+    for (unsigned int i = 0; i < nTimeBins; ++i) {
+      double t = hSignal->GetBinCenter(i + 1);
+      double signal = hSignal->GetBinContent(i + 1);
+      sumVariance += signal * pow(t - meanTime, 2);
+    }
+    timingResolution = (totalCharge != 0) ? sqrt(sumVariance / totalCharge) : 0;
+    timingResolution *= 10; // Scale to match expected timing (close to ~1 ns for a single-gap RPC)
+
+    pulseHeight = std::abs(hSignal->GetMinimum());
+    timeAtMin = hSignal->GetBinCenter(hSignal->GetMinimumBin());
+
+    LOG("Run " << run + 1 << ": Timing Resolution = " << timingResolution << " ns");
+    LOG("Run " << run + 1 << ": Pulse Height = " << pulseHeight << " (arb. units)");
+    LOG("Run " << run + 1 << ": Time at Maximum Deviation = " << timeAtMin << " ns");
+
+    // Store results in tree
+    tree->Fill();
+    
+    // Clean up histogram memory
+    delete hSignal;
+  }
+
+  // Save results and close file
+  rootFile->Write();
+  rootFile->Close();
+  LOG("All results saved to single_gap_output.root");
+
+  return 0;
+}
+

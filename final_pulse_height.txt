@@ -1,0 +1,154 @@
+#include <TApplication.h>
+#include <TCanvas.h>
+#include <TH1D.h>
+#include <TFile.h>
+#include <TROOT.h>
+#include <TSystem.h>
+#include <TTree.h>
+
+#include <cmath>
+#include <ctime>
+#include <fstream>
+#include <iostream>
+
+#include "Garfield/AvalancheGrid.hh"
+#include "Garfield/AvalancheMicroscopic.hh"
+#include "Garfield/ComponentParallelPlate.hh"
+#include "Garfield/FundamentalConstants.hh"
+#include "Garfield/GeometrySimple.hh"
+#include "Garfield/MediumMagboltz.hh"
+#include "Garfield/Plotting.hh"
+#include "Garfield/Sensor.hh"
+#include "Garfield/SolidBox.hh"
+#include "Garfield/TrackHeed.hh"
+#include "Garfield/ViewSignal.hh"
+
+#define LOG(x) std::cout << x << std::endl
+
+using namespace Garfield;
+
+int main(int argc, char *argv[]) {
+  TApplication app("app", &argc, argv);
+  plottingEngine.SetDefaultStyle();
+
+  const bool debug = true;
+  constexpr bool plotSignal = true;
+
+  const int N = 15;
+  const double epMylar = 3.1;
+  const double epGlaverbel = 8.;
+  const double epWindow = 6.;
+  const double epGas = 1.;
+
+  std::vector<double> eps = {epMylar, epWindow,    epGas,  epGlaverbel,
+                             epGas,   epGlaverbel, epGas,  epGlaverbel,
+                             epGas,   epGlaverbel, epGas,  epGlaverbel,
+                             epGas,   epWindow,    epMylar};
+
+  const double dMylar = 0.035;
+  const double dGlaverbell = 0.07;
+  const double dWindow = 0.12;
+  const double dGas = 0.025;
+
+  std::vector<double> thickness = {dMylar, dWindow,     dGas,  dGlaverbell,
+                                   dGas,   dGlaverbell, dGas,  dGlaverbell,
+                                   dGas,   dGlaverbell, dGas,  dGlaverbell,
+                                   dGas,   dWindow,     dMylar};
+
+  double totalThickness = 0.81;
+  const double voltage = -15e3;
+
+  ComponentParallelPlate *RPC = new ComponentParallelPlate();
+  RPC->Setup(N, eps, thickness, voltage);
+
+  const std::string label = "ReadoutPlane";
+  RPC->AddPlane(label);
+
+  MediumMagboltz gas;
+  gas.LoadGasFile("c2h2f4_ic4h10_sf6.gas");
+  gas.Initialise(true);
+
+  SolidBox box(0., totalThickness / 2, 0., 5., totalThickness / 2, 5.);
+  GeometrySimple geo;
+  geo.AddSolid(&box, &gas);
+  RPC->SetGeometry(&geo);
+  RPC->SetMedium(&gas);
+
+  Sensor sensor;
+  sensor.AddComponent(RPC);
+  sensor.AddElectrode(RPC, label);
+
+  const unsigned int nTimeBins = 200;
+  const double tmin = 0.;
+  const double tmax = 4;
+  const double tstep = (tmax - tmin) / nTimeBins;
+  sensor.SetTimeWindow(tmin, tstep, nTimeBins);
+
+  AvalancheMicroscopic aval;
+  aval.SetSensor(&sensor);
+  aval.EnableSignalCalculation();
+  aval.UseWeightingPotential();
+  aval.SetTimeWindow(0., 0.1);
+
+  AvalancheGrid avalgrid;
+  avalgrid.SetSensor(&sensor);
+  int steps = totalThickness * 1e4;
+  avalgrid.SetGrid(-0.05, 0.05, 5, 0.0, totalThickness, steps, -0.05, 0.05, 5);
+
+  TrackHeed track;
+  track.SetSensor(&sensor);
+  track.SetParticle("pion");
+  track.SetMomentum(7.e9);
+
+  std::clock_t start = std::clock();
+  track.NewTrack(0, totalThickness, 0, 0, 0, -1, 0);
+  for (const auto &cluster : track.GetClusters()) {
+    for (const auto &electron : cluster.electrons) {
+      aval.AvalancheElectron(electron.x, electron.y, electron.z, electron.t, 0.1, 0., 0., 0.);
+      avalgrid.ImportElectronsFromAvalancheMicroscopic(&aval);
+    }
+  }
+
+  LOG("Switching to grid based method.");
+  avalgrid.AsignLayerIndex(RPC);
+  avalgrid.StartGridAvalanche();
+  double duration = (std::clock() - start) / (double)CLOCKS_PER_SEC;
+  LOG("Script: Electrons have drifted. It took " << duration << "s to run.");
+
+  TFile *rootFile = new TFile("output.root", "RECREATE");
+  TH1D *hSignal = new TH1D("hSignal", "Induced Signal;Time [ns];Signal [arb. units]", nTimeBins, tmin, tmax);
+  TH1D *hCharge = new TH1D("hCharge", "Induced Charge;Time [ns];Charge [fC]", nTimeBins, tmin, tmax);
+
+  for (unsigned int i = 0; i < nTimeBins; ++i) {
+    hSignal->SetBinContent(i + 1, sensor.GetSignal(label, i));
+  }
+  sensor.IntegrateSignal(label);
+  for (unsigned int i = 0; i < nTimeBins; ++i) {
+    hCharge->SetBinContent(i + 1, sensor.GetSignal(label, i));
+  }
+
+  double areaSignal = hSignal->Integral();
+  double areaCharge = hCharge->Integral();
+  LOG("Area under Induced Signal curve: " << areaSignal);
+  LOG("Area under Induced Charge curve: " << areaCharge);
+
+  // Compute the Pulse Height (taking absolute value)
+  double pulseHeight = std::abs(hSignal->GetMinimum());
+  double timeAtMin = hSignal->GetBinCenter(hSignal->GetMinimumBin());
+  LOG("Pulse Height: " << pulseHeight << " (arb. units)");
+  LOG("Time at Maximum Deviation: " << timeAtMin << " ns");
+
+  // Store pulse height in a TTree
+  TTree *tree = new TTree("pulseTree", "Pulse Height Data");
+  tree->Branch("pulseHeight", &pulseHeight, "pulseHeight/D");
+  tree->Branch("timeAtMin", &timeAtMin, "timeAtMin/D");
+  tree->Fill();
+
+  // Save to ROOT file
+  rootFile->Write();
+  rootFile->Close();
+  LOG("Results saved to output.root");
+
+  app.Run(kTRUE);
+}
+
